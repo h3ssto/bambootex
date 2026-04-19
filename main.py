@@ -1,123 +1,194 @@
-import pandas as pd
+import os
+import shutil
+import subprocess
+import tempfile
+from dataclasses import dataclass
 from os import linesep
+from typing import Callable
+
+import pandas as pd
+
+
+def _as_formatter(fmt: str | Callable) -> Callable:
+    if callable(fmt):
+        return fmt
+    return lambda x: format(x, fmt)
+
+
+@dataclass
+class TextFormatter:
+    font: str | None = None
+    size: str | None = None
+
+    def __call__(self, value: str) -> str:
+        prefix = (self.size or "") + (self.font or "")
+        return fr"{prefix}{{{value}}}" if prefix else str(value)
+
+
+@dataclass
+class Cell:
+    text: str
+    hspan: int = 1
+    vspan: int = 1
+    align: str = "c"
+
+    def to_latex(self) -> str:
+        if not self.text:
+            return ""
+        if self.hspan == 1 and self.vspan == 1:
+            return fr"\thead{{{self.text}}}"
+        if self.vspan == 1:
+            return fr"\SetCell[c={self.hspan}]{{{self.align}}}{{\thead{{{self.text}}}}}"
+        return fr"\SetCell[c={self.hspan}, r={self.vspan}]{{{self.align}}}{{\thead{{{self.text}}}}}"
 
 
 class Table:
 
-    def __init__(self, df, columns, column_aligns = None, column_formatters = None, headers = None, vlines = None, packages = None):
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        columns: list[str],
+        column_aligns: str | list[str] | None = None,
+        column_formatters: dict[str, str | Callable] | None = None,
+        headers: list[list[Cell]] | None = None,
+        vlines: list[int] | None = None,
+        packages: list[str] | None = None,
+        number_format: str = ".2f",
+    ):
         self.df = df.copy()
-        
+
         for col in columns:
+            if isinstance(col, str) and col not in df:
+                raise ValueError(f"Column name {col!r} not in data frame.")
 
-            if isinstance(col, str):
-                if col not in df:
-                    raise ValueError(f"Column name {col} not in data frame.")
-
-        self.packages = packages if packages else []
         self.columns = columns
         self.column_aligns = column_aligns
         self.column_formatters = column_formatters
-        self.vlines = vlines
-
         self.headers = headers
+        self.vlines = vlines
+        self.packages = packages or []
+        self.number_format = number_format
+        self._highlights: list[tuple[str, Callable, str]] = []
 
+    def highlight(self, column: str, fn: Callable, color: str) -> "Table":
+        self._highlights.append((column, fn, color))
+        return self
 
-    def build(self):
-
-        if self.column_formatters:
-            for k, v in self.column_formatters.items():
-                self.df[k] = self.df[k].apply(v)
-
-        if self.column_aligns:
-            if self.column_aligns == "auto":
-                alignments = ["l" if self.df[col].dtype is str else "r" for col in self.columns]
-            else:
-                alignments = self.column_aligns
-
+    def _build_colspec(self) -> str:
+        if self.column_aligns == "auto":
+            alignments = [
+                "l" if pd.api.types.is_string_dtype(self.df[col]) else "r"
+                for col in self.columns
+            ]
+        elif self.column_aligns:
+            alignments = list(self.column_aligns)
         else:
-            alignments = ["l" for _ in self.columns]
+            alignments = ["l"] * len(self.columns)
 
-        vlines = sorted(self.vlines)
+        if self.vlines:
+            inc = 0
+            for v in sorted(self.vlines):
+                if v < 0:
+                    alignments.append("|")
+                else:
+                    alignments.insert(v + inc, "|")
+                    inc += 1
 
-        inc = 0
+        return "".join(alignments)
 
-        for v in vlines:
+    def _build_preamble(self, colspec: str) -> str:
+        pkgs = r"\usepackage{makecell}\usepackage{xcolor}\usepackage{tabularray}"
+        for pkg in self.packages:
+            pkgs += fr"\usepackage{{{pkg}}}"
+        return fr"\documentclass{{standalone}}{pkgs}\begin{{document}}\begin{{tblr}}{{colspec = {{{colspec}}}}}\hline"
 
-            if v < 0:
-                alignments.append("|")
-            else:
-                alignments.insert(v + inc, "|")
-                inc += 1
+    def _build_headers(self) -> list[str]:
+        if not self.headers:
+            return []
 
-        alignments = "".join(alignments)
+        lines = []
+        for header in self.headers:
+            cells = [cell.to_latex() for cell in header]
+            lines.append(f"&{linesep}".join(cells) + r"\\")
 
-        pre = fr"\documentclass{{standalone}}\usepackage{{makecell}}\usepackage{{tabularray}}\begin{{document}}\begin{{tblr}}{{colspec = {{{alignments}}}}}\hline"
+        lines[-1] += r"\hline"
+        return lines
 
-        header_lines = []
+    def _compute_highlights(self, df: pd.DataFrame) -> dict[tuple[int, str], str]:
+        highlights: dict[tuple[int, str], str] = {}
+        for col, fn, color in self._highlights:
+            result = fn(df[col])
+            mask = result if isinstance(result, pd.Series) else df[col] == result
+            for idx in df.index[mask]:
+                highlights[(idx, col)] = color
+        return highlights
 
+    def _build_content(self, df: pd.DataFrame, highlights: dict[tuple[int, str], str]) -> list[str]:
+        rows = []
+        for idx, row in df.iterrows():
+            cells = [
+                fr"\SetCell{{bg={highlights[(idx, col)]}}} {row[col]}"
+                if (idx, col) in highlights else str(row[col])
+                for col in self.columns
+            ]
+            rows.append("&".join(cells) + r"\\")
+        return rows
+
+    def to_tex(self, output_path: str):
+        df = self.df.copy()
+        highlights = self._compute_highlights(df)
+        formatters = {
+            col: _as_formatter(self.number_format)
+            for col in self.columns
+            if pd.api.types.is_float_dtype(df[col])
+        }
+        if self.column_formatters:
+            formatters.update({col: _as_formatter(fmt) for col, fmt in self.column_formatters.items()})
+        for col, fmt in formatters.items():
+            df[col] = df[col].apply(fmt)
+
+        colspec = self._build_colspec()
+        pre = self._build_preamble(colspec)
         post = r"\end{tblr}\end{document}"
+        lines = [pre, *self._build_headers(), *self._build_content(df, highlights), post]
 
-        print(pre)
+        with open(output_path, "w+") as fp:
+            fp.writelines(line + linesep for line in lines)
 
-        if self.headers:
-            for header in self.headers:
-                line = []
-                for entry in header:
-                    if isinstance(entry, str):
-                        if entry:
-                            line.append(fr"\thead{{{entry}}}")
-                        else:
-                            line.append("")
-                    else:  # tuple
-
-                        if len(entry) == 3:
-                            hspan, align, entry = entry
-                            line.append(fr'\SetCell[c={hspan}]{{{align}}}{{\thead{{{entry}}}}}')
-                        else:
-                            hspan, vspan, align, entry = entry
-
-                            line.append(fr'\SetCell[c={hspan}, r={vspan}]{{{align}}}{{\thead{{{entry}}}}}')
-
-
-                header_lines.append(f"&{linesep}".join(line) + r"\\")
-
-        if header_lines:
-            header_lines[-1] += r"\hline"
-        print(post)
-
-        content = []
-
-        for _, row in self.df.iloc[1:].iterrows():
-            line = []
-            for col in self.columns:
-                line.append(str(row[col]))
-
-            line = "&".join(line) + r"\\"
-            content.append(line)
-
-
-        lines = [pre, *header_lines, *content, post]
-        
-        lines = [line + linesep for line in lines]
-
-        with open("test.tex", "w+") as fp:
-            fp.writelines(lines)
-
+    def to_pdf(self, output_path: str):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tex_path = os.path.join(tmpdir, "table.tex")
+            self.to_tex(tex_path)
+            result = subprocess.run(
+                ["pdflatex", "-interaction=nonstopmode", tex_path],
+                cwd=tmpdir,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"pdflatex failed:\n{result.stdout}")
+            shutil.copy(os.path.join(tmpdir, "table.pdf"), output_path)
 
 
 def main():
-
     df = pd.read_csv("https://raw.githubusercontent.com/mwaskom/seaborn-data/master/iris.csv")
 
-    print(df)
+    tbl = Table(
+        df,
+        columns=["species", "sepal_length", "sepal_width"],
+        column_aligns="auto",
+        column_formatters=dict(species=TextFormatter(font=r"\textsf", size=r"\small")),
+        headers=[
+            [Cell("Species", vspan=2), Cell("Sepal", hspan=2)],
+            [Cell(""), Cell("Length"), Cell("Width")],
+        ],
+        vlines=[0, 1, -1],
+        packages=["libertine"],
+    )
 
-    tbl = Table(df, columns = ["species", "sepal_length", "sepal_width"], column_aligns = "auto", column_formatters = dict(species = lambda x: rf"\textsf{{{x}}}", sepal_length = lambda x: f"{x:.2f}"), headers = [[(1, 2, "c", "Species"), (2, "c", "Sepal")], ["", "Length", "Width"]], vlines = [0, 1, -1], packages = ["libertine"])
-    
-
-    tbl.build()
-
-    print(df)
+    tbl.highlight("sepal_length", lambda x: x > 4.5, "red!25")
+    tbl.to_pdf("output.pdf")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
