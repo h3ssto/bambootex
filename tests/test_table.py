@@ -95,3 +95,39 @@ class TestHighlight:
         content = open(path).read()
         # row 0: a=1.0 is min; row 1: b=1.0 is min — both should be highlighted
         assert content.count(r"\SetCell{bg=green}") == 2
+
+
+class TestMergeRows:
+    def test_merges_consecutive_equal_values(self):
+        df = pd.DataFrame({
+            "group": ["a", "a", "b"],
+            "val": [1.0, 2.0, 3.0],
+        })
+        content = make_table(df, ["group", "val"], merge_rows=["group"])
+        assert r"\SetCell[c=1, r=2]{c}{a}" in content
+        assert "{}" in content
+        assert r"\SetCell[c=1, r=2]{c}{b}" not in content
+
+    def test_no_merge_for_singleton_run(self):
+        df = pd.DataFrame({"group": ["a", "b"], "val": [1.0, 2.0]})
+        content = make_table(df, ["group", "val"], merge_rows=["group"])
+        assert "r=" not in content
+
+    def test_rejects_unknown_merge_rows_column(self):
+        df = pd.DataFrame({"group": ["a"], "val": [1.0]})
+        with pytest.raises(ValueError):
+            Table(df, ["val"], merge_rows=["group"])
+
+    def test_merge_combines_with_highlight(self):
+        df = pd.DataFrame({
+            "group": ["a", "a"],
+            "val": [1.0, 2.0],
+        })
+        t = Table(df, ["group", "val"], merge_rows=["group"])
+        t.highlight("group", SimpleHighlighter("yellow"), lambda s: s == "a")
+        with tempfile.NamedTemporaryFile(suffix=".tex", delete=False) as f:
+            path = f.name
+        t.to_tex(path)
+        content = open(path).read()
+        assert "bg=yellow" in content
+        assert "r=2" in content

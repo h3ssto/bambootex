@@ -12,6 +12,21 @@ from .formatters import TextFormatter, NumberFormatter, _as_formatter, _latex_es
 from .highlighters import Highlighter
 
 
+def _run_lengths(values: list) -> list[int]:
+    if not values:
+        return []
+    runs = []
+    count = 1
+    for prev, curr in zip(values, values[1:]):
+        if curr == prev:
+            count += 1
+        else:
+            runs.append(count)
+            count = 1
+    runs.append(count)
+    return runs
+
+
 class Table:
 
     def __init__(
@@ -25,12 +40,17 @@ class Table:
         vlines: list[int] | None = None,
         hlines: list[int] | None = None,
         default_size: str | None = None,
+        merge_rows: list[str] | None = None,
     ):
         self.df = df.copy()
 
         for col in columns:
             if isinstance(col, str) and col not in df:
                 raise ValueError(f"Column name {col!r} not in data frame.")
+
+        for col in merge_rows or []:
+            if col not in columns:
+                raise ValueError(f"merge_rows column {col!r} not in columns.")
 
         self.columns = columns
         self.column_formatters = column_formatters
@@ -40,6 +60,7 @@ class Table:
         self.vlines = vlines or []
         self.hlines = hlines or []
         self.default_size = default_size
+        self.merge_rows = merge_rows or []
         self._highlights: list[tuple[str | list[str], Highlighter, tuple[Callable, ...]]] = []
 
     def sort_by(
@@ -71,7 +92,7 @@ class Table:
         return " ".join(specs)
 
     def _build_preamble(self) -> str:
-        pkgs = r"\usepackage{xcolor}\usepackage{amssymb}\usepackage{tabularray}\usepackage{babel}\usepackage{siunitx}\UseTblrLibrary{siunitx}\usepackage{lmodern}\renewcommand{\familydefault}{\sfdefault}"
+        pkgs = r"\usepackage{xcolor}\usepackage{amssymb}\usepackage{tabularray}\SetTblrInner{leftsep = 4pt,rightsep = 2pt}\usepackage{babel}\usepackage{siunitx}\UseTblrLibrary{siunitx}\usepackage{lmodern}\renewcommand{\familydefault}{\sfdefault}"
         for pkg in self.packages:
             pkgs += rf"\usepackage{{{pkg}}}"
         size_cmd = rf"\AtBeginDocument{{{self.default_size}}}" if self.default_size else ""
@@ -120,22 +141,53 @@ class Table:
     def _build_content(
         self, df: pd.DataFrame, highlights: dict[tuple[int, str], str]
     ) -> list[str]:
-        rows = []
-        for idx, row in df.iterrows():
-            cells = [
-                (
-                    rf"\SetCell{{bg={highlights[(idx, col)]}}} {row[col]}"
-                    if (idx, col) in highlights
-                    else str(row[col])
-                )
-                for col in self.columns
-            ]
-            rows.append("&".join(cells) + r"\\")
-        return rows
+        column_cells: dict[str, list[str]] = {}
+        for col in self.columns:
+            cells = []
+            skip = 0
+            for i, val in enumerate(df[col].tolist()):
+                if skip > 0:
+                    skip -= 1
+                    cells.append("{}")
+                    continue
+                if isinstance(val, Cell):
+                    cells.append(val.to_latex() or "{}")
+                    skip = val.vspan - 1
+                else:
+                    idx = df.index[i]
+                    if (idx, col) in highlights:
+                        cells.append(rf"\SetCell{{bg={highlights[(idx, col)]}}} {val}")
+                    else:
+                        cells.append(str(val))
+            column_cells[col] = cells
+
+        return [
+            "&".join(column_cells[col][i] for col in self.columns) + r"\\"
+            for i in range(len(df))
+        ]
+
+    def _apply_merge_rows(
+        self,
+        df: pd.DataFrame,
+        merge_runs: dict[str, list[int]],
+        highlights: dict[tuple[Any, str], str],
+    ) -> None:
+        for col, runs in merge_runs.items():
+            values = df[col].tolist()
+            merged = []
+            pos = 0
+            for length in runs:
+                head_idx = df.index[pos]
+                bg = highlights.get((head_idx, col))
+                merged.append(Cell(str(values[pos]), vspan=length, bg=bg))
+                merged.extend(values[pos + 1 : pos + length])
+                pos += length
+            df[col] = merged
 
     def to_tex(self, output_path: str):
         df = self.df.copy()
         highlights = self._compute_highlights(df)
+        merge_runs = {col: _run_lengths(df[col].tolist()) for col in self.merge_rows}
 
         for col in self.columns:
             if pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_string_dtype(df[col]):
@@ -154,6 +206,9 @@ class Table:
 
         for col, fmt in formatters.items():
             df[col] = df[col].apply(fmt)
+
+        if merge_runs:
+            self._apply_merge_rows(df, merge_runs, highlights)
 
         pre = self._build_preamble()
         post = r"\end{tblr}\end{document}"
